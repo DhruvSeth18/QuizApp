@@ -276,6 +276,98 @@ public class QuizController {
         }
     }
 
+    @PostMapping("/addMultipleQues")
+    public ResponseEntity<?> addMultipleQues(
+            @RequestBody List<QuestionDao> questionList,  // Excel se parsed questions
+            @RequestParam String quizId,
+            @RequestHeader("Authorization") String authHeader) {
+
+        Map<String, Object> map = new HashMap<>();
+
+        try {
+            if (quizId == null) {
+                return ResponseEntity.badRequest().body("Please enter quiz");
+            }
+
+            if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+                map.put("Message", "Authorization header missing or invalid");
+                return ResponseEntity.status(401).body(map);
+            }
+
+            // Token se userId nikal lo
+            String token = authHeader.substring(7);
+            String userId = jwtUtil.extractUserId(token);
+
+            Optional<Quiz> quizOpt = quizRepository.findById(quizId);
+            if (!quizOpt.isPresent()) {
+                return ResponseEntity.badRequest().body("Quiz not found or expired");
+            }
+
+            Quiz quiz = quizOpt.get();
+
+            // Check if user is creator
+            if (!quiz.getCreatedBy().equals(userId)) {
+                map.put("Message", "You are not authorized to modify this quiz");
+                return ResponseEntity.status(403).body(map);
+            }
+
+            List<Questions> existingQuestions = quiz.getQuestions();
+            if (existingQuestions == null) {
+                existingQuestions = new ArrayList<>();
+            }
+
+            int totalAllowed = quiz.getTotalQuestions();
+            int spaceLeft = totalAllowed - existingQuestions.size();
+
+            if (spaceLeft <= 0) {
+                return ResponseEntity.badRequest()
+                        .body("You have already reached the max limit of " + totalAllowed + " questions.");
+            }
+
+            List<String> addedQuestions = new ArrayList<>();
+            List<String> skippedQuestions = new ArrayList<>();
+
+            for (QuestionDao qDao : questionList) {
+                if (existingQuestions.size() >= totalAllowed) {
+                    skippedQuestions.add(qDao.getQuestionText() + " (limit reached)");
+                    continue;
+                }
+
+                boolean questionExists = existingQuestions.stream()
+                        .anyMatch(q -> q.getQuestionText().equalsIgnoreCase(qDao.getQuestionText()));
+                if (questionExists) {
+                    skippedQuestions.add(qDao.getQuestionText() + " (duplicate)");
+                    continue;
+                }
+
+                Questions q = new Questions();
+                q.setId(UUID.randomUUID().toString());
+                q.setQuestionText(qDao.getQuestionText());
+                q.setCorrectOption(qDao.getCorrectOption());
+                q.setTimeLimit(qDao.getTimeLimit());
+                q.setOptions(qDao.getOptions());
+
+                existingQuestions.add(q);
+                addedQuestions.add(q.getQuestionText());
+            }
+
+            quiz.setQuestions(existingQuestions);
+            quizRepository.save(quiz);
+
+            map.put("Message", "Questions processed successfully");
+            map.put("AddedQuestions", addedQuestions);
+            map.put("SkippedQuestions", skippedQuestions);
+            map.put("TotalNow", existingQuestions.size());
+
+            return ResponseEntity.ok(map);
+
+        } catch (Exception e) {
+            log.error("Error occurred: " + e.getMessage());
+            return ResponseEntity.badRequest().body("Error occurred: " + e.getMessage());
+        }
+    }
+
+
     @DeleteMapping("/deletequestion")
     public ResponseEntity<?> deleteQuestion(
             @RequestParam String quizId,
@@ -658,7 +750,6 @@ public class QuizController {
     public ResponseEntity<?> submitQuiz(
             @RequestHeader("Authorization") String token,
             @RequestParam String quizId) {
-
         try {
             Map<String, Object> response = new HashMap<>();
 
@@ -1221,7 +1312,7 @@ public ResponseEntity<?> completeQuiz(@RequestParam String attemptId) {
             return ResponseEntity.badRequest().body("Something went wrong : "+e.getMessage());
         }
     }
-    
+
     @PostMapping("/submit-answer")
     public ResponseEntity<?> submitAnswer(
             @RequestHeader("Authorization") String token,
@@ -1238,31 +1329,35 @@ public ResponseEntity<?> completeQuiz(@RequestParam String attemptId) {
             QuizAttempt attempt = quizAttemptRepository.findById(quizAttemptId)
                     .orElseThrow(() -> new RuntimeException("QuizAttempt not found"));
 
-            // 🔹 Update selectedOption in shuffledQuestions
-            attempt.getShuffledQuestions().forEach(q -> {
-                if (q.getId().equals(questionId)) {
-                    q.setSelectedOption(selectedOption);
-                }
-            });
-
-            // 🔹 Update or add in attemptedQuestions
+            // 🔹 Update selectedOption and correct field in shuffledQuestions & attemptedQuestions
             boolean found = false;
-            for (QuestionAttempt qa : attempt.getAttemptedQuestions()) {
-                if (qa.getQuestionId().equals(questionId)) {
-                    qa.setSelectedOption(selectedOption);
-                    found = true;
-                    break;
+            for (Questions q : attempt.getShuffledQuestions()) {
+                if (q.getId().equals(questionId)) {
+                    q.setSelectedOption(selectedOption); // update selectedOption
+
+                    boolean isCorrect = selectedOption.equals(q.getCorrectOption());
+
+                    // update or add in attemptedQuestions
+                    for (QuestionAttempt qa : attempt.getAttemptedQuestions()) {
+                        if (qa.getQuestionId().equals(questionId)) {
+                            qa.setSelectedOption(selectedOption);
+                            qa.setCorrect(isCorrect); // correct evaluation
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found) {
+                        QuestionAttempt qa = new QuestionAttempt();
+                        qa.setQuestionId(questionId);
+                        qa.setSelectedOption(selectedOption);
+                        qa.setCorrect(isCorrect);
+                        attempt.getAttemptedQuestions().add(qa);
+                    }
                 }
             }
-            if (!found) {
-                QuestionAttempt qa = new QuestionAttempt();
-                qa.setQuestionId(questionId);
-                qa.setSelectedOption(selectedOption);
-                qa.setCorrect(false); // backend se correct evaluation later
-                attempt.getAttemptedQuestions().add(qa);
-            }
 
-            // 🔹 Save QuizAttempt
+            // 🔹 Save updated attempt
             QuizAttempt savedAttempt = quizAttemptRepository.save(attempt);
 
             // 🔹 Response
@@ -1281,5 +1376,44 @@ public ResponseEntity<?> completeQuiz(@RequestParam String attemptId) {
         }
     }
 
+    @PostMapping("/disturbance")
+    public ResponseEntity<?> addDisturbance(@RequestParam String attemptId) {
 
+        QuizAttempt attempt = quizAttemptRepository.findById(attemptId)
+                .orElseThrow(() -> new RuntimeException("Quiz attempt not found"));
+
+        // ❌ Already submitted / ended
+        if (Boolean.TRUE.equals(attempt.getEndQuiz())) {
+            return ResponseEntity.ok(Map.of(
+                    "message", "Quiz already ended",
+                    "totalDisturbance", attempt.getTotalDisturbance()
+            ));
+        }
+
+        int current = attempt.getTotalDisturbance();
+
+        // 🔒 Max limit = 3
+        if (current < 3) {
+            current++;
+            attempt.setTotalDisturbance(current);
+        }
+
+        // 🚨 Auto end quiz if reached 3
+        if (current >= 3) {
+            attempt.setEndQuiz(true);
+            attempt.setStatus("AUTO_SUBMITTED");
+            attempt.setSubmittedAt(LocalDateTime.now());
+        }
+
+        quizAttemptRepository.save(attempt);
+
+        return ResponseEntity.ok(Map.of(
+                "message", current >= 3
+                        ? "Max disturbance reached. Quiz auto submitted."
+                        : "Disturbance recorded",
+                "totalDisturbance", current,
+                "endQuiz", attempt.getEndQuiz(),
+                "status", attempt.getStatus()
+        ));
+    }
 }
